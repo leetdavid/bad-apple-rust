@@ -1,7 +1,7 @@
 use clap::Parser;
 use crossterm::{cursor, execute, terminal};
 use rodio::{Decoder, OutputStream, Sink};
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::time::Instant;
 
 const FRAME_SIZE: usize = 2400; // 160 * 120 / 8
@@ -24,15 +24,29 @@ fn main() {
     let num_frames = frames_bytes.len() / FRAME_SIZE;
 
     // Audio setup
-    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-    let sink = Sink::try_new(&stream_handle).unwrap();
+    let audio_res = OutputStream::try_default();
+    let (_stream, stream_handle) = match audio_res {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Audio device error: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let sink = match Sink::try_new(&stream_handle) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Audio sink error: {:?}", e);
+            std::process::exit(1);
+        }
+    };
     let cursor_audio = std::io::Cursor::new(audio_bytes);
     let source = Decoder::new(cursor_audio).unwrap();
 
     // Terminal setup
     let mut stdout = stdout();
-    terminal::enable_raw_mode().unwrap();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide).unwrap();
+    let has_tty = terminal::enable_raw_mode().is_ok();
+    let _ = execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide);
 
     sink.append(source);
     sink.play();
@@ -50,15 +64,22 @@ fn main() {
                 break;
             }
 
-            let frame_data = &frames_bytes[current_frame * FRAME_SIZE..(current_frame + 1) * FRAME_SIZE];
-            
+            let frame_data =
+                &frames_bytes[current_frame * FRAME_SIZE..(current_frame + 1) * FRAME_SIZE];
+
             let (term_w, term_h) = terminal::size().unwrap_or((80, 24));
             render_frame(&mut stdout, frame_data, term_w, term_h, is_block);
         }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(10)).unwrap() {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read().unwrap() {
-                if key.code == crossterm::event::KeyCode::Char('q') || key.code == crossterm::event::KeyCode::Esc || (key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) && key.code == crossterm::event::KeyCode::Char('c')) {
+        if let Ok(true) = crossterm::event::poll(std::time::Duration::from_millis(10)) {
+            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                if key.code == crossterm::event::KeyCode::Char('q')
+                    || key.code == crossterm::event::KeyCode::Esc
+                    || (key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key.code == crossterm::event::KeyCode::Char('c'))
+                {
                     break;
                 }
             }
@@ -66,11 +87,19 @@ fn main() {
     }
 
     // Restore terminal
-    execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen).unwrap();
-    terminal::disable_raw_mode().unwrap();
+    let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
+    if has_tty {
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
-fn render_frame(stdout: &mut std::io::Stdout, frame: &[u8], term_w: u16, term_h: u16, is_block: bool) {
+fn render_frame(
+    stdout: &mut std::io::Stdout,
+    frame: &[u8],
+    term_w: u16,
+    term_h: u16,
+    is_block: bool,
+) {
     let vid_aspect = 160.0 / 120.0;
     let mut draw_w = term_w;
     let mut draw_h = (term_w as f32 / vid_aspect / 2.0).round() as u16;
@@ -78,7 +107,7 @@ fn render_frame(stdout: &mut std::io::Stdout, frame: &[u8], term_w: u16, term_h:
         draw_h = term_h;
         draw_w = (term_h as f32 * 2.0 * vid_aspect).round() as u16;
     }
-    
+
     let draw_w = draw_w.max(1);
     let draw_h = draw_h.max(1);
 
@@ -86,7 +115,7 @@ fn render_frame(stdout: &mut std::io::Stdout, frame: &[u8], term_w: u16, term_h:
     let offset_y = (term_h.saturating_sub(draw_h)) / 2;
 
     let mut buf = String::with_capacity((term_w as usize * term_h as usize) + term_h as usize * 10);
-    
+
     buf.push_str("\x1b[H"); // Move cursor to home
 
     for y in 0..term_h {
@@ -96,16 +125,16 @@ fn render_frame(stdout: &mut std::io::Stdout, frame: &[u8], term_w: u16, term_h:
             } else {
                 let rel_x = x - offset_x;
                 let rel_y = y - offset_y;
-                
+
                 let src_x = ((rel_x as f32 / draw_w as f32) * 160.0) as usize;
-                
+
                 if is_block {
                     let src_y_top = ((rel_y as f32 / draw_h as f32) * 120.0) as usize;
                     let src_y_bottom = (((rel_y as f32 + 0.5) / draw_h as f32) * 120.0) as usize;
-                    
+
                     let top = get_pixel(frame, src_x, src_y_top);
                     let bottom = get_pixel(frame, src_x, src_y_bottom);
-                    
+
                     match (top, bottom) {
                         (false, false) => buf.push(' '),
                         (true, false) => buf.push('▀'),
@@ -123,7 +152,7 @@ fn render_frame(stdout: &mut std::io::Stdout, frame: &[u8], term_w: u16, term_h:
             buf.push_str("\r\n");
         }
     }
-    
+
     stdout.write_all(buf.as_bytes()).unwrap();
     stdout.flush().unwrap();
 }
