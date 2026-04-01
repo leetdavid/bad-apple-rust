@@ -13,7 +13,7 @@ This takes a moment: it embeds ~15MB of compressed audio and video frames into t
 ## Running
 
 ```bash
-./target/release/badcrabapple
+./target/release/bad-apple
 ```
 
 This plays the video in the default **block** mode. The video scales automatically to your terminal size, maintaining the original 4:3 aspect ratio. Press `q`, `Esc`, or `Ctrl+C` to quit.
@@ -35,8 +35,8 @@ There are five built-in modes:
 Use either the flag shorthand or `--mode <name>`:
 
 ```bash
-./target/release/badcrabapple --shading
-./target/release/badcrabapple --mode shading
+./target/release/bad-apple --shading
+./target/release/bad-apple --mode shading
 ```
 
 ## Custom Characters
@@ -46,8 +46,8 @@ Use either the flag shorthand or `--mode <name>`:
 Provide exactly 4 characters in the order: **empty · top-lit · bottom-lit · fully-lit**.
 
 ```bash
-./target/release/badcrabapple --chars " .':"
-./target/release/badcrabapple --chars " 가을뿔"
+./target/release/bad-apple --chars " .':"
+./target/release/bad-apple --chars " 가을뿔"
 ```
 
 ### `--gradient` / `-g` — sample from a palette
@@ -55,8 +55,8 @@ Provide exactly 4 characters in the order: **empty · top-lit · bottom-lit · f
 Provide a string of 2 or more characters from darkest to brightest. Four characters are sampled evenly from it (at 0%, 33%, 67%, 100%) and used for the four states.
 
 ```bash
-./target/release/badcrabapple -g " .:-=+*#%@"
-./target/release/badcrabapple -g " ░▒▓█"
+./target/release/bad-apple -g " .:-=+*#%@"
+./target/release/bad-apple -g " ░▒▓█"
 ```
 
 For both options, character display width is detected automatically — wide/CJK characters (2 columns) get a different aspect ratio correction than narrow characters (1 column).
