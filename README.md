@@ -1,34 +1,66 @@
 # Bad Crab Apple 🦀🍏
 
-A standalone, completely cross-platform, single-binary CLI player for "Bad Apple!!" written in Rust.
+A standalone, single-binary CLI player for "Bad Apple!!" written in Rust. Audio and video are compiled directly into the binary — no external files or dependencies needed at runtime.
 
-All assets (audio and video frames) are aggressively compressed and **compiled directly into the binary as raw bits**, allowing it to play perfectly synchronized video and audio in your terminal without any external dependencies at runtime.
+## Building
 
-## Features
-- **Zero Dependencies:** No need for `ffmpeg`, `vlc`, or external video/audio files at runtime. Everything is inside the executable.
-- **Dynamic Resizing:** The video will automatically scale to fit any terminal window size while maintaining its 4:3 aspect ratio.
-- **Two Render Modes:**
-  - **Block Mode (Default):** Uses Unicode half-block characters (`▀`, `▄`, `█`) to double the vertical resolution of your terminal, providing smooth, high-quality playback.
-  - **ASCII Mode:** Uses standard ASCII characters to render the frames.
-
-## Usage
-
-Build the release binary (this will take a moment as it embeds the ~15MB highly compressed asset files):
 ```bash
 cargo build --release
 ```
 
-Run the application:
-```bash
-# Run with the default high-resolution Block mode
-./target/release/badcrabapple
+This takes a moment: it embeds ~15MB of compressed audio and video frames into the binary.
 
-# Run with standard ASCII mode
-./target/release/badcrabapple --mode ascii
+## Running
+
+```bash
+./target/release/badcrabapple
 ```
 
-## Controls
-- `q`, `Esc`, or `Ctrl+C` to quit the player early.
+This plays the video in the default **block** mode. The video scales automatically to your terminal size, maintaining the original 4:3 aspect ratio. Press `q`, `Esc`, or `Ctrl+C` to quit.
 
-## How it works (The Asset Pipeline)
-The original video was processed into a 160x120 raw binary format. To achieve maximum compression and allow embedding into the Rust binary, it was thresholded to 1-bit per pixel (pure black and white), allowing 8 pixels to be packed into a single byte. The resulting `frames.bin` file contains exactly 6572 frames and is ~15MB.
+## Render Modes
+
+The renderer maps each 1-bit pixel to a terminal character. Because terminal characters are taller than they are wide, each row samples **two video rows** (top half and bottom half), giving four possible states per character: empty, top-lit, bottom-lit, and fully-lit.
+
+There are five built-in modes:
+
+| Mode | Flag | Characters | Notes |
+|------|------|------------|-------|
+| `block` | `--block` | `' '` `▀` `▄` `█` | Default. Highest visual quality. |
+| `ascii` | `--ascii` | `'.'` `^` `v` `@` | Narrow ASCII characters. |
+| `shading` | `--shading` | `' '` `░` `▒` `█` | Unicode block shading. |
+| `classic` | `--classic` | `' '` `-` `*` `@` | Sampled from `" .:-=+*#%@"`. |
+| `korean` | `--korean` | `시` `뽁` `늙` `뾃` | Wide (2-column) Korean glyphs. Aspect ratio is corrected automatically. |
+
+Use either the flag shorthand or `--mode <name>`:
+
+```bash
+./target/release/badcrabapple --shading
+./target/release/badcrabapple --mode shading
+```
+
+## Custom Characters
+
+### `--chars` — specify all four states directly
+
+Provide exactly 4 characters in the order: **empty · top-lit · bottom-lit · fully-lit**.
+
+```bash
+./target/release/badcrabapple --chars " .':"
+./target/release/badcrabapple --chars " 가을뿔"
+```
+
+### `--gradient` / `-g` — sample from a palette
+
+Provide a string of 2 or more characters from darkest to brightest. Four characters are sampled evenly from it (at 0%, 33%, 67%, 100%) and used for the four states.
+
+```bash
+./target/release/badcrabapple -g " .:-=+*#%@"
+./target/release/badcrabapple -g " ░▒▓█"
+```
+
+For both options, character display width is detected automatically — wide/CJK characters (2 columns) get a different aspect ratio correction than narrow characters (1 column).
+
+## How it works
+
+The original video was thresholded to 1-bit per pixel (pure black and white) and scaled to 160×120. At 1 bit per pixel, 8 pixels pack into a single byte. The resulting `frames.bin` contains 6,572 frames at 30 fps and is ~15MB. Audio is stored as a compressed MP3. Both are embedded into the binary at compile time via `include_bytes!`.
