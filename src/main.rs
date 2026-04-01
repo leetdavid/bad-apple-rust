@@ -456,6 +456,7 @@ fn main() {
                         &meta,
                         &mode_label,
                         show_controls,
+                        paused,
                         &mut render_buf,
                     );
                 }
@@ -465,6 +466,8 @@ fn main() {
 
         if let Ok(true) = crossterm::event::poll(Duration::from_millis(10)) {
             if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                // Ignore key-repeat and key-release; only act on the initial press.
+                if key.kind != crossterm::event::KeyEventKind::Press { continue; }
                 match key.code {
                     crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('c')
@@ -486,6 +489,9 @@ fn main() {
                             paused = true;
                             sink.pause();
                         }
+                        // Re-render immediately so the controls bar reflects the new state.
+                        let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
+                        render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, show_controls, paused, &mut render_buf);
                     }
                     crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Char('l') => {
                         let current_pos = if paused {
@@ -525,6 +531,7 @@ fn main() {
                                 &meta,
                                 &mode_label,
                                 show_controls,
+                                paused,
                                 &mut render_buf,
                             );
                         }
@@ -580,6 +587,7 @@ fn render_frame(
     meta: &prepare::VideoMeta,
     mode_label: &str,
     show_controls: bool,
+    paused: bool,
     buf: &mut Vec<u8>,
 ) {
     let vid_aspect = meta.orig_width as f32 / meta.orig_height as f32;
@@ -715,8 +723,9 @@ fn render_frame(
 
     // Bottom bar — full-width reverse-video strip on the last row
     let bar_text = if show_controls {
+        let pause_label = if paused { "resume" } else { "pause" };
         let s = format!(
-            " [{}]  [←/→] mode  [k] pause  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
+            " [{}]  [←/→] mode  [k] {pause_label}  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
             mode_label
         );
         // Pad or truncate to exactly term_w columns so the bar fills the row
