@@ -12,7 +12,7 @@ const FPS: f64 = 30.0;
 #[command(version, about = "Bad Apple CLI player")]
 struct Cli {
     /// Render mode [possible values: block, ascii, korean, classic, shading]
-    #[arg(short, long, default_value = "block")]
+    #[arg(short, long, default_value = "classic")]
     mode: String,
 
     /// Use block mode (shorthand for --mode block)

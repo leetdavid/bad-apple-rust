@@ -26,10 +26,10 @@ There are five built-in modes:
 
 | Mode | Flag | Characters | Notes |
 |------|------|------------|-------|
-| `block` | `--block` | `' '` `▀` `▄` `█` | Default. Highest visual quality. |
+| `classic` | `--classic` | `' '` `-` `*` `@` | **Default.** Sampled from `" .:-=+*#%@"`. |
+| `block` | `--block` | `' '` `▀` `▄` `█` | Highest visual quality. |
 | `ascii` | `--ascii` | `'.'` `^` `v` `@` | Narrow ASCII characters. |
 | `shading` | `--shading` | `' '` `░` `▒` `█` | Unicode block shading. |
-| `classic` | `--classic` | `' '` `-` `*` `@` | Sampled from `" .:-=+*#%@"`. |
 | `korean` | `--korean` | `시` `뽁` `늙` `뾃` | Wide (2-column) Korean glyphs. Aspect ratio is corrected automatically. |
 
 Use either the flag shorthand or `--mode <name>`:
