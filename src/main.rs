@@ -431,31 +431,33 @@ fn main() {
         let target_frame = (elapsed * FPS) as usize;
 
         if !paused && target_frame > current_frame {
-            // Skip ahead in the file to the target frame, then read it
-            while current_frame < target_frame {
-                match frames_reader.read_exact(&mut frame_buf) {
-                    Ok(()) => current_frame += 1,
-                    Err(_) => {
-                        done = true;
-                        break;
-                    }
-                }
+            // Seek directly to target frame instead of reading through skipped frames.
+            // Reading each skipped frame takes O(frame_size) time and compounds lag —
+            // every slow render pushes target_frame further ahead on the next iteration.
+            if target_frame > current_frame + 1 {
+                let byte_offset = target_frame as u64 * frame_size as u64;
+                let _ = frames_reader.seek(SeekFrom::Start(byte_offset));
+                current_frame = target_frame;
             }
-            if !done {
-                let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                render_frame(
-                    &mut stdout,
-                    &frame_buf,
-                    frame_w,
-                    frame_h,
-                    tw,
-                    th,
-                    &render_mode,
-                    colorize,
-                    &meta,
-                    &mode_label,
-                    &mut render_buf,
-                );
+            match frames_reader.read_exact(&mut frame_buf) {
+                Ok(()) => {
+                    current_frame += 1;
+                    let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
+                    render_frame(
+                        &mut stdout,
+                        &frame_buf,
+                        frame_w,
+                        frame_h,
+                        tw,
+                        th,
+                        &render_mode,
+                        colorize,
+                        &meta,
+                        &mode_label,
+                        &mut render_buf,
+                    );
+                }
+                Err(_) => { done = true; }
             }
         }
 
