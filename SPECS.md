@@ -29,9 +29,17 @@ When a new source is prepared, the following steps run:
 1. **Download** (remote URLs only): `yt-dlp` downloads the video to a temp file as MP4.
 2. **Dimensions**: `ffprobe` reads the original width and height, stored in `meta.txt`.
 3. **Audio**: `ffmpeg` extracts audio as MP3.
-4. **Frames**: `ffmpeg` scales the video to 160px wide (height derived from original aspect ratio) at 30 fps and pipes raw RGB24 pixels (3 bytes per pixel) into `frames.bin`.
+4. **Video**: The video file is kept as `video.mp4` in the cache. Frames are **not** pre-processed; they are decoded at runtime at the exact resolution needed for the current terminal.
 
-Cached files per source: `audio.mp3`, `frames.bin`, `meta.txt`.
+Cached files per source: `video.mp4`, `audio.mp3`, `meta.txt`.
+
+## Runtime Frame Decoding
+
+At playback start, the renderer computes the frame dimensions that exactly fill the terminal at the video's aspect ratio. It then spawns `ffmpeg` to pipe raw RGB24 frames at that resolution, decoded at 30 fps. This means:
+
+- Any terminal size is supported at full fidelity — no upscaling artifacts.
+- The cache is terminal-size-independent and never needs to be regenerated for a different terminal.
+- `ffmpeg` must be available at runtime (not just at prepare time).
 
 # Configuring the Renderer
 
