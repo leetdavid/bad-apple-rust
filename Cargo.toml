@@ -1,7 +1,12 @@
 [package]
-name = "badcrabapple"
+name = "bad-apple"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal-based player for the Bad Apple!! music video."
+readme = "README.md"
+homepage = "https://github.com/leetdavid/bad-apple-rust"
+repository = "https://github.com/leetdavid/bad-apple-rust"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
