@@ -38,17 +38,23 @@ fn push_num(buf: &mut Vec<u8>, n: u8) {
 #[inline(always)]
 fn push_color_fg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
     buf.extend_from_slice(b"\x1b[38;2;");
-    push_num(buf, r); buf.push(b';');
-    push_num(buf, g); buf.push(b';');
-    push_num(buf, b); buf.push(b'm');
+    push_num(buf, r);
+    buf.push(b';');
+    push_num(buf, g);
+    buf.push(b';');
+    push_num(buf, b);
+    buf.push(b'm');
 }
 
 #[inline(always)]
 fn push_color_bg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
     buf.extend_from_slice(b"\x1b[48;2;");
-    push_num(buf, r); buf.push(b';');
-    push_num(buf, g); buf.push(b';');
-    push_num(buf, b); buf.push(b'm');
+    push_num(buf, r);
+    buf.push(b';');
+    push_num(buf, g);
+    buf.push(b';');
+    push_num(buf, b);
+    buf.push(b'm');
 }
 
 #[inline(always)]
@@ -69,35 +75,35 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// Render mode [possible values: classic, block, ascii, shading, korean, full-color]
+    /// Render mode [possible values: full-color, ascii-color, ascii, braille, korean, shading]
     #[arg(short, long, default_value = "full-color")]
     mode: String,
 
-    /// Use block mode (shorthand for --mode block)
-    #[arg(long, conflicts_with_all = ["ascii", "korean", "classic", "shading"])]
-    block: bool,
-
-    /// Use ASCII mode (shorthand for --mode ascii)
-    #[arg(long, conflicts_with_all = ["block", "korean", "classic", "shading"])]
-    ascii: bool,
-
-    /// Use Korean wide-character mode (shorthand for --mode korean)
-    #[arg(long, conflicts_with_all = ["block", "ascii", "classic", "shading"])]
-    korean: bool,
-
-    /// Use classic ASCII gradient mode: " .:-=+*#%@" (shorthand for --mode classic)
-    #[arg(long, conflicts_with_all = ["block", "ascii", "korean", "shading"])]
-    classic: bool,
-
-    /// Use Unicode block shading mode: " ░▒▓█" (shorthand for --mode shading)
-    #[arg(long, conflicts_with_all = ["block", "ascii", "korean", "classic"])]
-    shading: bool,
-
-    /// Use full-color mode: ▀ with ANSI 24-bit fg/bg per pixel (shorthand for --mode full-color)
-    #[arg(long = "full-color", conflicts_with_all = ["block", "ascii", "korean", "classic", "shading", "monochrome"])]
+    /// ▀ with 24-bit fg/bg color per pixel
+    #[arg(long = "full-color", conflicts_with_all = ["ascii_color", "ascii", "braille", "korean", "shading", "monochrome"])]
     full_color: bool,
 
-    /// Disable ANSI colors; render in terminal default foreground/background only.
+    /// .:-=+*#%@ gradient with color
+    #[arg(long = "ascii-color", conflicts_with_all = ["full_color", "ascii", "braille", "korean", "shading"])]
+    ascii_color: bool,
+
+    /// .:-=+*#%@ gradient, monochrome
+    #[arg(long, conflicts_with_all = ["full_color", "ascii_color", "braille", "korean", "shading"])]
+    ascii: bool,
+
+    /// ⠁⠃⠇⠧⠷⠿ braille gradient with color
+    #[arg(long, conflicts_with_all = ["full_color", "ascii_color", "ascii", "korean", "shading"])]
+    braille: bool,
+
+    /// Korean wide-character gradient with color
+    #[arg(long, conflicts_with_all = ["full_color", "ascii_color", "ascii", "braille", "shading"])]
+    korean: bool,
+
+    /// ░▒█ block shading, monochrome
+    #[arg(long, conflicts_with_all = ["full_color", "ascii_color", "ascii", "braille", "korean"])]
+    shading: bool,
+
+    /// Disable ANSI colors (overrides mode default).
     #[arg(long, conflicts_with_all = ["full_color"])]
     monochrome: bool,
 
@@ -160,15 +166,35 @@ impl CharSet {
             .max()
             .unwrap_or(1)
             .max(1);
-        Ok(CharSet { empty: chars[0], top: chars[1], bottom: chars[2], full: chars[3], col_width })
-    }
-
-    fn block() -> Self {
-        CharSet { empty: ' ', top: '▀', bottom: '▄', full: '█', col_width: 1 }
+        Ok(CharSet {
+            empty: chars[0],
+            top: chars[1],
+            bottom: chars[2],
+            full: chars[3],
+            col_width,
+        })
     }
 
     fn ascii() -> Self {
-        CharSet { empty: '.', top: '^', bottom: 'v', full: '@', col_width: 1 }
+        // Sampled from ".:-=+*#%@": positions 0, 2, 5, 8
+        CharSet {
+            empty: '.',
+            top: '-',
+            bottom: '*',
+            full: '@',
+            col_width: 1,
+        }
+    }
+
+    fn braille() -> Self {
+        // Sampled from "⠁⠃⠇⠧⠷⠿": positions 0, 1, 3, 5
+        CharSet {
+            empty: '⠁',
+            top: '⠃',
+            bottom: '⠧',
+            full: '⠿',
+            col_width: 1,
+        }
     }
 
     fn from_gradient(s: &str) -> Result<Self, String> {
@@ -181,26 +207,46 @@ impl CharSet {
         }
         let last = chars.len() - 1;
         let indices = [0, (last * 1 / 3).min(last), (last * 2 / 3).min(last), last];
-        let sampled = [chars[indices[0]], chars[indices[1]], chars[indices[2]], chars[indices[3]]];
+        let sampled = [
+            chars[indices[0]],
+            chars[indices[1]],
+            chars[indices[2]],
+            chars[indices[3]],
+        ];
         let col_width = sampled
             .iter()
             .map(|c| c.width().unwrap_or(1) as u16)
             .max()
             .unwrap_or(1)
             .max(1);
-        Ok(CharSet { empty: sampled[0], top: sampled[1], bottom: sampled[2], full: sampled[3], col_width })
-    }
-
-    fn classic() -> Self {
-        CharSet { empty: ' ', top: '-', bottom: '*', full: '@', col_width: 1 }
+        Ok(CharSet {
+            empty: sampled[0],
+            top: sampled[1],
+            bottom: sampled[2],
+            full: sampled[3],
+            col_width,
+        })
     }
 
     fn shading() -> Self {
-        CharSet { empty: ' ', top: '░', bottom: '▒', full: '█', col_width: 1 }
+        CharSet {
+            empty: ' ',
+            top: '░',
+            bottom: '▒',
+            full: '█',
+            col_width: 1,
+        }
     }
 
     fn korean() -> Self {
-        CharSet { empty: '시', top: '뽁', bottom: '늙', full: '뾃', col_width: 2 }
+        // Sampled from "ㅇㅎ시늙뀪뾃": positions 0, 1, 3, 5
+        CharSet {
+            empty: 'ㅇ',
+            top: '시',
+            bottom: '늙',
+            full: '뾃',
+            col_width: 2,
+        }
     }
 }
 
@@ -215,20 +261,36 @@ fn main() {
     let frame_width = cli.width as usize;
 
     let cache_entry = if cli.url.is_some() || cli.force {
-        match prepare::run(cli.url, cli.force, frame_width, cli.cookies_from_browser, cli.cookies, cli.extractor_args) {
+        match prepare::run(
+            cli.url,
+            cli.force,
+            frame_width,
+            cli.cookies_from_browser,
+            cli.cookies,
+            cli.extractor_args,
+        ) {
             Ok(dir) => dir,
-            Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
     } else {
         match prepare::last_cache_entry() {
             Some(dir) => dir,
-            None => { eprintln!("No cached video found. Run: bad-apple <URL>"); std::process::exit(1); }
+            None => {
+                eprintln!("No cached video found. Run: bad-apple <URL>");
+                std::process::exit(1);
+            }
         }
     };
 
     let meta = match prepare::load_meta(&cache_entry) {
         Ok(m) => m,
-        Err(e) => { eprintln!("Error loading video metadata: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Error loading video metadata: {e}");
+            std::process::exit(1);
+        }
     };
 
     let audio_bytes = std::fs::read(cache_entry.join("audio.mp3")).unwrap_or_else(|_| {
@@ -236,37 +298,74 @@ fn main() {
         std::process::exit(1);
     });
 
-    let mut colorize = !cli.monochrome;
+    let monochrome = cli.monochrome;
 
-    let mode = if cli.full_color { "full-color" }
-        else if cli.block   { "block"   }
-        else if cli.ascii   { "ascii"   }
-        else if cli.korean  { "korean"  }
-        else if cli.classic { "classic" }
-        else if cli.shading { "shading" }
-        else                { cli.mode.as_str() };
+    let mode = if cli.full_color {
+        "full-color"
+    } else if cli.ascii_color {
+        "ascii-color"
+    } else if cli.ascii {
+        "ascii"
+    } else if cli.braille {
+        "braille"
+    } else if cli.korean {
+        "korean"
+    } else if cli.shading {
+        "shading"
+    } else {
+        cli.mode.as_str()
+    };
 
-    const BUILTIN_MODES: &[&str] = &["classic", "block", "ascii", "shading", "korean", "full-color"];
-    let mut mode_idx = BUILTIN_MODES.iter().position(|&m| m == mode).unwrap_or(0);
+    // Each builtin mode carries its default colorize setting.
+    const BUILTIN_MODES: &[(&str, bool)] = &[
+        ("full-color", true),
+        ("ascii-color", true),
+        ("ascii", false),
+        ("braille", true),
+        ("korean", true),
+        ("shading", false),
+    ];
+    let mut mode_idx = BUILTIN_MODES
+        .iter()
+        .position(|&(m, _)| m == mode)
+        .unwrap_or(0);
 
     let mut render_mode = if let Some(s) = &cli.chars {
         match CharSet::from_str(s) {
             Ok(cs) => RenderMode::Charset(cs),
-            Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
     } else if let Some(s) = &cli.gradient {
         match CharSet::from_gradient(s) {
             Ok(cs) => RenderMode::Charset(cs),
-            Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
     } else {
         render_mode_for_builtin(mode)
     };
 
+    // Use the mode's default colorize unless --monochrome overrides it.
+    let mode_default_colorize = BUILTIN_MODES[mode_idx].1;
+    let mut colorize = if monochrome {
+        false
+    } else {
+        mode_default_colorize
+    };
+
     let mut mode_label: String = if cli.chars.is_some() || cli.gradient.is_some() {
         match &render_mode {
             RenderMode::Charset(cs) => {
-                let prefix = if cli.chars.is_some() { "custom" } else { "gradient" };
+                let prefix = if cli.chars.is_some() {
+                    "custom"
+                } else {
+                    "gradient"
+                };
                 format!("{} {}{}{}{}", prefix, cs.empty, cs.top, cs.bottom, cs.full)
             }
             RenderMode::FullColor => "full-color".to_string(),
@@ -291,11 +390,17 @@ fn main() {
     // Audio setup
     let (_stream, stream_handle) = match OutputStream::try_default() {
         Ok(s) => s,
-        Err(e) => { eprintln!("Audio device error: {e:?}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Audio device error: {e:?}");
+            std::process::exit(1);
+        }
     };
     let sink = match Sink::try_new(&stream_handle) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Audio sink error: {e:?}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Audio sink error: {e:?}");
+            std::process::exit(1);
+        }
     };
     let source = Decoder::new(std::io::Cursor::new(audio_bytes)).unwrap();
 
@@ -318,7 +423,11 @@ fn main() {
     let mut render_buf: Vec<u8> = Vec::with_capacity(term_w as usize * term_h as usize * 24);
 
     while !done {
-        let elapsed = if paused { base_offset } else { base_offset + base_time.elapsed().as_secs_f64() };
+        let elapsed = if paused {
+            base_offset
+        } else {
+            base_offset + base_time.elapsed().as_secs_f64()
+        };
         let target_frame = (elapsed * FPS) as usize;
 
         if !paused && target_frame > current_frame {
@@ -326,12 +435,27 @@ fn main() {
             while current_frame < target_frame {
                 match frames_reader.read_exact(&mut frame_buf) {
                     Ok(()) => current_frame += 1,
-                    Err(_) => { done = true; break; }
+                    Err(_) => {
+                        done = true;
+                        break;
+                    }
                 }
             }
             if !done {
                 let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, &mut render_buf);
+                render_frame(
+                    &mut stdout,
+                    &frame_buf,
+                    frame_w,
+                    frame_h,
+                    tw,
+                    th,
+                    &render_mode,
+                    colorize,
+                    &meta,
+                    &mode_label,
+                    &mut render_buf,
+                );
             }
         }
 
@@ -340,8 +464,15 @@ fn main() {
                 match key.code {
                     crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('c')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => break,
-                    crossterm::event::KeyCode::Char('c') => { colorize = !colorize; }
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        break;
+                    }
+                    crossterm::event::KeyCode::Char('c') => {
+                        colorize = !colorize;
+                    }
                     crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Char(' ') => {
                         if paused {
                             paused = false;
@@ -354,8 +485,16 @@ fn main() {
                         }
                     }
                     crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Char('l') => {
-                        let current_pos = if paused { base_offset } else { base_offset + base_time.elapsed().as_secs_f64() };
-                        let delta = if key.code == crossterm::event::KeyCode::Char('j') { -10.0 } else { 10.0 };
+                        let current_pos = if paused {
+                            base_offset
+                        } else {
+                            base_offset + base_time.elapsed().as_secs_f64()
+                        };
+                        let delta = if key.code == crossterm::event::KeyCode::Char('j') {
+                            -10.0
+                        } else {
+                            10.0
+                        };
                         let new_pos = (current_pos + delta).max(0.0);
                         let new_frame = (new_pos * FPS) as usize;
                         let byte_offset = new_frame as u64 * frame_size as u64;
@@ -364,23 +503,43 @@ fn main() {
                         base_offset = new_pos;
                         base_time = Instant::now();
                         let _ = sink.try_seek(Duration::from_secs_f64(new_pos));
-                        if paused { sink.pause(); }
+                        if paused {
+                            sink.pause();
+                        }
                         // Read and render one frame so the display updates immediately
                         if frames_reader.read_exact(&mut frame_buf).is_ok() {
                             current_frame += 1;
                             let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                            render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, &mut render_buf);
+                            render_frame(
+                                &mut stdout,
+                                &frame_buf,
+                                frame_w,
+                                frame_h,
+                                tw,
+                                th,
+                                &render_mode,
+                                colorize,
+                                &meta,
+                                &mode_label,
+                                &mut render_buf,
+                            );
                         }
                     }
                     crossterm::event::KeyCode::Left => {
                         mode_idx = (mode_idx + BUILTIN_MODES.len() - 1) % BUILTIN_MODES.len();
-                        render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx]);
-                        mode_label = BUILTIN_MODES[mode_idx].to_string();
+                        render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx].0);
+                        mode_label = BUILTIN_MODES[mode_idx].0.to_string();
+                        if !monochrome {
+                            colorize = BUILTIN_MODES[mode_idx].1;
+                        }
                     }
                     crossterm::event::KeyCode::Right => {
                         mode_idx = (mode_idx + 1) % BUILTIN_MODES.len();
-                        render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx]);
-                        mode_label = BUILTIN_MODES[mode_idx].to_string();
+                        render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx].0);
+                        mode_label = BUILTIN_MODES[mode_idx].0.to_string();
+                        if !monochrome {
+                            colorize = BUILTIN_MODES[mode_idx].1;
+                        }
                     }
                     _ => {}
                 }
@@ -389,18 +548,19 @@ fn main() {
     }
 
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
-    if has_tty { let _ = terminal::disable_raw_mode(); }
+    if has_tty {
+        let _ = terminal::disable_raw_mode();
+    }
 }
-
 
 fn render_mode_for_builtin(mode: &str) -> RenderMode {
     match mode {
         "full-color" => RenderMode::FullColor,
-        "block"   => RenderMode::Charset(CharSet::block()),
-        "ascii"   => RenderMode::Charset(CharSet::ascii()),
-        "shading" => RenderMode::Charset(CharSet::shading()),
-        "korean"  => RenderMode::Charset(CharSet::korean()),
-        _         => RenderMode::Charset(CharSet::classic()),
+        "ascii-color" => RenderMode::Charset(CharSet::ascii()),
+        "ascii" => RenderMode::Charset(CharSet::ascii()),
+        "braille" => RenderMode::Charset(CharSet::braille()),
+        "korean" => RenderMode::Charset(CharSet::korean()),
+        _ => RenderMode::Charset(CharSet::shading()),
     }
 }
 
@@ -449,21 +609,26 @@ fn render_frame(
             for y in 0..term_h {
                 let mut x = 0u16;
                 while x < term_w {
-                    let in_bounds = x >= offset_x && x < offset_x + draw_w_cols
-                        && y >= offset_y && y < offset_y + draw_h;
+                    let in_bounds = x >= offset_x
+                        && x < offset_x + draw_w_cols
+                        && y >= offset_y
+                        && y < offset_y + draw_h;
 
                     if !in_bounds {
                         if colorize && last_fg != sentinel {
                             buf.extend_from_slice(b"\x1b[0m");
                             last_fg = sentinel;
                         }
-                        for _ in 0..col_step { buf.push(b' '); }
+                        for _ in 0..col_step {
+                            buf.push(b' ');
+                        }
                     } else {
                         let rel_x = (x - offset_x) / col_step;
                         let rel_y = y - offset_y;
                         let src_x = ((rel_x as f32 / draw_w as f32) * frame_w as f32) as usize;
                         let src_y_top = ((rel_y as f32 / draw_h as f32) * frame_h as f32) as usize;
-                        let src_y_bot = (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
+                        let src_y_bot =
+                            (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
                         let top = get_pixel(frame, src_x, src_y_top, frame_w, frame_h);
                         let bottom = get_pixel(frame, src_x, src_y_bot, frame_w, frame_h);
                         if colorize {
@@ -475,9 +640,9 @@ fn render_frame(
                         }
                         let ch = match (top, bottom) {
                             (false, false) => cs.empty,
-                            (true,  false) => cs.top,
-                            (false, true)  => cs.bottom,
-                            (true,  true)  => cs.full,
+                            (true, false) => cs.top,
+                            (false, true) => cs.bottom,
+                            (true, true) => cs.full,
                         };
                         push_char(buf, ch);
                     }
@@ -487,7 +652,9 @@ fn render_frame(
                     buf.extend_from_slice(b"\x1b[0m");
                     last_fg = sentinel;
                 }
-                if y < term_h - 1 { buf.extend_from_slice(b"\r\n"); }
+                if y < term_h - 1 {
+                    buf.extend_from_slice(b"\r\n");
+                }
             }
         }
         RenderMode::FullColor => {
@@ -497,8 +664,10 @@ fn render_frame(
 
             for y in 0..term_h {
                 for x in 0..term_w {
-                    let in_bounds = x >= offset_x && x < offset_x + draw_w_cols
-                        && y >= offset_y && y < offset_y + draw_h;
+                    let in_bounds = x >= offset_x
+                        && x < offset_x + draw_w_cols
+                        && y >= offset_y
+                        && y < offset_y + draw_h;
 
                     if !in_bounds {
                         if last_fg != sentinel || last_bg != sentinel {
@@ -512,7 +681,8 @@ fn render_frame(
                         let rel_y = y - offset_y;
                         let src_x = ((rel_x as f32 / draw_w as f32) * frame_w as f32) as usize;
                         let src_y_top = ((rel_y as f32 / draw_h as f32) * frame_h as f32) as usize;
-                        let src_y_bot = (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
+                        let src_y_bot =
+                            (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
                         let fg = get_rgb(frame, src_x, src_y_top, frame_w, frame_h);
                         let bg = get_rgb(frame, src_x, src_y_bot, frame_w, frame_h);
                         if fg != last_fg {
@@ -531,7 +701,9 @@ fn render_frame(
                     last_fg = sentinel;
                     last_bg = sentinel;
                 }
-                if y < term_h - 1 { buf.extend_from_slice(b"\r\n"); }
+                if y < term_h - 1 {
+                    buf.extend_from_slice(b"\r\n");
+                }
             }
         }
     }
@@ -544,7 +716,13 @@ fn render_frame(
     stdout.flush().unwrap();
 }
 
-fn get_rgb(frame: &[u8], src_x: usize, src_y: usize, frame_w: usize, frame_h: usize) -> (u8, u8, u8) {
+fn get_rgb(
+    frame: &[u8],
+    src_x: usize,
+    src_y: usize,
+    frame_w: usize,
+    frame_h: usize,
+) -> (u8, u8, u8) {
     let src_x = src_x.clamp(0, frame_w - 1);
     let src_y = src_y.clamp(0, frame_h - 1);
     let base = (src_y * frame_w + src_x) * 3;
