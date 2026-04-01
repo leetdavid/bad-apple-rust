@@ -9,6 +9,54 @@ use unicode_width::UnicodeWidthChar;
 
 const FPS: f64 = 30.0;
 
+// Precomputed ASCII digit bytes for 0–255, avoiding format!/write! in the hot path.
+// Each entry is [len, d0, d1, d2] where len is the number of valid digits.
+const fn make_num_table() -> [[u8; 4]; 256] {
+    let mut t = [[0u8; 4]; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        let n = i as u8;
+        if n < 10 {
+            t[i] = [1, b'0' + n, 0, 0];
+        } else if n < 100 {
+            t[i] = [2, b'0' + n / 10, b'0' + n % 10, 0];
+        } else {
+            t[i] = [3, b'0' + n / 100, b'0' + (n / 10) % 10, b'0' + n % 10];
+        }
+        i += 1;
+    }
+    t
+}
+static BYTE_NUMS: [[u8; 4]; 256] = make_num_table();
+
+#[inline(always)]
+fn push_num(buf: &mut Vec<u8>, n: u8) {
+    let e = &BYTE_NUMS[n as usize];
+    buf.extend_from_slice(&e[1..1 + e[0] as usize]);
+}
+
+#[inline(always)]
+fn push_color_fg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
+    buf.extend_from_slice(b"\x1b[38;2;");
+    push_num(buf, r); buf.push(b';');
+    push_num(buf, g); buf.push(b';');
+    push_num(buf, b); buf.push(b'm');
+}
+
+#[inline(always)]
+fn push_color_bg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
+    buf.extend_from_slice(b"\x1b[48;2;");
+    push_num(buf, r); buf.push(b';');
+    push_num(buf, g); buf.push(b';');
+    push_num(buf, b); buf.push(b'm');
+}
+
+#[inline(always)]
+fn push_char(buf: &mut Vec<u8>, c: char) {
+    let mut tmp = [0u8; 4];
+    buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+}
+
 #[derive(Parser)]
 #[command(version, about = "Bad Apple CLI player")]
 struct Cli {
@@ -266,6 +314,8 @@ fn main() {
     let mut paused = false;
     let mut current_frame = 0usize;
     let mut done = false;
+    // Reused across frames to avoid per-frame allocation
+    let mut render_buf: Vec<u8> = Vec::with_capacity(term_w as usize * term_h as usize * 24);
 
     while !done {
         let elapsed = if paused { base_offset } else { base_offset + base_time.elapsed().as_secs_f64() };
@@ -281,7 +331,7 @@ fn main() {
             }
             if !done {
                 let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label);
+                render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, &mut render_buf);
             }
         }
 
@@ -319,7 +369,7 @@ fn main() {
                         if frames_reader.read_exact(&mut frame_buf).is_ok() {
                             current_frame += 1;
                             let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                            render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label);
+                            render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, &mut render_buf);
                         }
                     }
                     crossterm::event::KeyCode::Left => {
@@ -365,6 +415,7 @@ fn render_frame(
     colorize: bool,
     meta: &prepare::VideoMeta,
     mode_label: &str,
+    buf: &mut Vec<u8>,
 ) {
     let vid_aspect = meta.orig_width as f32 / meta.orig_height as f32;
     let col_step = match render_mode {
@@ -387,12 +438,11 @@ fn render_frame(
     let offset_x = ((term_w.saturating_sub(draw_w_cols)) / 2 / col_step) * col_step;
     let offset_y = (term_h.saturating_sub(draw_h)) / 2;
 
-    let mut buf = String::with_capacity(term_w as usize * term_h as usize * 8);
-    buf.push_str("\x1b[H");
+    buf.clear();
+    buf.extend_from_slice(b"\x1b[H");
 
     match render_mode {
         RenderMode::Charset(cs) => {
-            use std::fmt::Write as _;
             let sentinel = (255u8, 255u8, 255u8);
             let mut last_fg = sentinel;
 
@@ -404,10 +454,10 @@ fn render_frame(
 
                     if !in_bounds {
                         if colorize && last_fg != sentinel {
-                            buf.push_str("\x1b[0m");
+                            buf.extend_from_slice(b"\x1b[0m");
                             last_fg = sentinel;
                         }
-                        for _ in 0..col_step { buf.push(' '); }
+                        for _ in 0..col_step { buf.push(b' '); }
                     } else {
                         let rel_x = (x - offset_x) / col_step;
                         let rel_y = y - offset_y;
@@ -419,28 +469,28 @@ fn render_frame(
                         if colorize {
                             let fg = get_rgb(frame, src_x, src_y_top, frame_w, frame_h);
                             if fg != last_fg {
-                                write!(buf, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2).unwrap();
+                                push_color_fg(buf, fg.0, fg.1, fg.2);
                                 last_fg = fg;
                             }
                         }
-                        match (top, bottom) {
-                            (false, false) => buf.push(cs.empty),
-                            (true,  false) => buf.push(cs.top),
-                            (false, true)  => buf.push(cs.bottom),
-                            (true,  true)  => buf.push(cs.full),
-                        }
+                        let ch = match (top, bottom) {
+                            (false, false) => cs.empty,
+                            (true,  false) => cs.top,
+                            (false, true)  => cs.bottom,
+                            (true,  true)  => cs.full,
+                        };
+                        push_char(buf, ch);
                     }
                     x += col_step;
                 }
                 if colorize && last_fg != sentinel {
-                    buf.push_str("\x1b[0m");
+                    buf.extend_from_slice(b"\x1b[0m");
                     last_fg = sentinel;
                 }
-                if y < term_h - 1 { buf.push_str("\r\n"); }
+                if y < term_h - 1 { buf.extend_from_slice(b"\r\n"); }
             }
         }
         RenderMode::FullColor => {
-            use std::fmt::Write as _;
             let sentinel = (255u8, 255u8, 255u8);
             let mut last_fg = sentinel;
             let mut last_bg = sentinel;
@@ -452,11 +502,11 @@ fn render_frame(
 
                     if !in_bounds {
                         if last_fg != sentinel || last_bg != sentinel {
-                            buf.push_str("\x1b[0m");
+                            buf.extend_from_slice(b"\x1b[0m");
                             last_fg = sentinel;
                             last_bg = sentinel;
                         }
-                        buf.push(' ');
+                        buf.push(b' ');
                     } else {
                         let rel_x = x - offset_x;
                         let rel_y = y - offset_y;
@@ -466,33 +516,31 @@ fn render_frame(
                         let fg = get_rgb(frame, src_x, src_y_top, frame_w, frame_h);
                         let bg = get_rgb(frame, src_x, src_y_bot, frame_w, frame_h);
                         if fg != last_fg {
-                            write!(buf, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2).unwrap();
+                            push_color_fg(buf, fg.0, fg.1, fg.2);
                             last_fg = fg;
                         }
                         if bg != last_bg {
-                            write!(buf, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2).unwrap();
+                            push_color_bg(buf, bg.0, bg.1, bg.2);
                             last_bg = bg;
                         }
-                        buf.push('▀');
+                        buf.extend_from_slice(b"\xe2\x96\x80"); // ▀
                     }
                 }
                 if last_fg != sentinel || last_bg != sentinel {
-                    buf.push_str("\x1b[0m");
+                    buf.extend_from_slice(b"\x1b[0m");
                     last_fg = sentinel;
                     last_bg = sentinel;
                 }
-                if y < term_h - 1 { buf.push_str("\r\n"); }
+                if y < term_h - 1 { buf.extend_from_slice(b"\r\n"); }
             }
         }
     }
 
-    // Overlay mode label at bottom-left in reverse video
-    {
-        use std::fmt::Write as _;
-        write!(buf, "\x1b[{};1H\x1b[7m[{}]\x1b[0m", term_h, mode_label).unwrap();
-    }
+    // Overlay mode label at bottom-left in reverse video (not in hot path)
+    let label = format!("\x1b[{};1H\x1b[7m[{}]\x1b[0m", term_h, mode_label);
+    buf.extend_from_slice(label.as_bytes());
 
-    stdout.write_all(buf.as_bytes()).unwrap();
+    stdout.write_all(buf).unwrap();
     stdout.flush().unwrap();
 }
 
