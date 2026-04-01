@@ -2,7 +2,7 @@
 name = "bad-apple"
 version = "0.1.0"
 edition = "2024"
-description = "A terminal-based player for the Bad Apple!! music video."
+description = "A terminal-based player for videos."
 readme = "README.md"
 homepage = "https://github.com/leetdavid/bad-apple-rust"
 repository = "https://github.com/leetdavid/bad-apple-rust"
