@@ -417,6 +417,7 @@ fn main() {
     let mut base_offset: f64 = 0.0;
     let mut base_time = Instant::now();
     let mut paused = false;
+    let mut show_controls = true;
     let mut current_frame = 0usize;
     let mut done = false;
     // Reused across frames to avoid per-frame allocation
@@ -454,6 +455,7 @@ fn main() {
                         colorize,
                         &meta,
                         &mode_label,
+                        show_controls,
                         &mut render_buf,
                     );
                 }
@@ -472,9 +474,8 @@ fn main() {
                     {
                         break;
                     }
-                    crossterm::event::KeyCode::Char('c') => {
-                        colorize = !colorize;
-                    }
+                    crossterm::event::KeyCode::Char('c') => { colorize = !colorize; }
+                    crossterm::event::KeyCode::Char('h') => { show_controls = !show_controls; }
                     crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Char(' ') => {
                         if paused {
                             paused = false;
@@ -523,6 +524,7 @@ fn main() {
                                 colorize,
                                 &meta,
                                 &mode_label,
+                                show_controls,
                                 &mut render_buf,
                             );
                         }
@@ -577,6 +579,7 @@ fn render_frame(
     colorize: bool,
     meta: &prepare::VideoMeta,
     mode_label: &str,
+    show_controls: bool,
     buf: &mut Vec<u8>,
 ) {
     let vid_aspect = meta.orig_width as f32 / meta.orig_height as f32;
@@ -710,9 +713,20 @@ fn render_frame(
         }
     }
 
-    // Overlay mode label at bottom-left in reverse video (not in hot path)
-    let label = format!("\x1b[{};1H\x1b[7m[{}]\x1b[0m", term_h, mode_label);
-    buf.extend_from_slice(label.as_bytes());
+    // Bottom bar — full-width reverse-video strip on the last row
+    let bar_text = if show_controls {
+        let s = format!(
+            " [{}]  [←/→] mode  [k] pause  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
+            mode_label
+        );
+        // Pad or truncate to exactly term_w columns so the bar fills the row
+        let tw = term_w as usize;
+        if s.len() < tw { format!("{:<width$}", s, width = tw) } else { s[..tw].to_string() }
+    } else {
+        format!(" [{}]  [h] show controls", mode_label)
+    };
+    let bar = format!("\x1b[{};1H\x1b[7m{}\x1b[0m", term_h, bar_text);
+    buf.extend_from_slice(bar.as_bytes());
 
     stdout.write_all(buf).unwrap();
     stdout.flush().unwrap();
