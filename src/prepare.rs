@@ -224,7 +224,7 @@ fn extract_frames(input: &Path, output: &Path, frame_w: usize, frame_h: usize) -
         .args([
             "-y",
             "-i", input.to_str().unwrap(),
-            "-vf", &format!("scale={frame_w}:{frame_h}"),
+            "-vf", &format!("scale={frame_w}:{frame_h},fps=30"),
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
             output.to_str().unwrap(),
