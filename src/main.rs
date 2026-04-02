@@ -420,6 +420,9 @@ fn main() {
     let mut show_controls = true;
     let mut current_frame = 0usize;
     let mut done = false;
+    let mut fps_frames: u32 = 0;
+    let mut fps_timer = Instant::now();
+    let mut fps: f32 = 0.0;
     // Reused across frames to avoid per-frame allocation
     let mut render_buf: Vec<u8> = Vec::with_capacity(term_w as usize * term_h as usize * 24);
 
@@ -443,6 +446,13 @@ fn main() {
             match frames_reader.read_exact(&mut frame_buf) {
                 Ok(()) => {
                     current_frame += 1;
+                    fps_frames += 1;
+                    let fps_elapsed = fps_timer.elapsed().as_secs_f32();
+                    if fps_elapsed >= 1.0 {
+                        fps = fps_frames as f32 / fps_elapsed;
+                        fps_frames = 0;
+                        fps_timer = Instant::now();
+                    }
                     let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
                     render_frame(
                         &mut stdout,
@@ -457,17 +467,22 @@ fn main() {
                         &mode_label,
                         show_controls,
                         paused,
+                        fps,
                         &mut render_buf,
                     );
                 }
-                Err(_) => { done = true; }
+                Err(_) => {
+                    done = true;
+                }
             }
         }
 
         if let Ok(true) = crossterm::event::poll(Duration::from_millis(10)) {
             if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
                 // Ignore key-repeat and key-release; only act on the initial press.
-                if key.kind != crossterm::event::KeyEventKind::Press { continue; }
+                if key.kind != crossterm::event::KeyEventKind::Press {
+                    continue;
+                }
                 match key.code {
                     crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('c')
@@ -477,8 +492,12 @@ fn main() {
                     {
                         break;
                     }
-                    crossterm::event::KeyCode::Char('c') => { colorize = !colorize; }
-                    crossterm::event::KeyCode::Char('h') => { show_controls = !show_controls; }
+                    crossterm::event::KeyCode::Char('c') => {
+                        colorize = !colorize;
+                    }
+                    crossterm::event::KeyCode::Char('h') => {
+                        show_controls = !show_controls;
+                    }
                     crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Char(' ') => {
                         if paused {
                             paused = false;
@@ -491,7 +510,22 @@ fn main() {
                         }
                         // Re-render immediately so the controls bar reflects the new state.
                         let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                        render_frame(&mut stdout, &frame_buf, frame_w, frame_h, tw, th, &render_mode, colorize, &meta, &mode_label, show_controls, paused, &mut render_buf);
+                        render_frame(
+                            &mut stdout,
+                            &frame_buf,
+                            frame_w,
+                            frame_h,
+                            tw,
+                            th,
+                            &render_mode,
+                            colorize,
+                            &meta,
+                            &mode_label,
+                            show_controls,
+                            paused,
+                            fps,
+                            &mut render_buf,
+                        );
                     }
                     crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Char('l') => {
                         let current_pos = if paused {
@@ -532,6 +566,7 @@ fn main() {
                                 &mode_label,
                                 show_controls,
                                 paused,
+                                fps,
                                 &mut render_buf,
                             );
                         }
@@ -588,6 +623,7 @@ fn render_frame(
     mode_label: &str,
     show_controls: bool,
     paused: bool,
+    fps: f32,
     buf: &mut Vec<u8>,
 ) {
     let vid_aspect = meta.orig_width as f32 / meta.orig_height as f32;
@@ -725,12 +761,16 @@ fn render_frame(
     let bar_text = if show_controls {
         let pause_label = if paused { "resume" } else { "pause" };
         let s = format!(
-            " [{}]  [←/→] mode  [k] {pause_label}  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
-            mode_label
+            "{:.1}fps  [{}]  [←/→] mode  [k] {pause_label}  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
+            fps, mode_label,
         );
         // Pad or truncate to exactly term_w columns so the bar fills the row
         let tw = term_w as usize;
-        if s.len() < tw { format!("{:<width$}", s, width = tw) } else { s[..tw].to_string() }
+        if s.len() < tw {
+            format!("{:<width$}", s, width = tw)
+        } else {
+            s[..tw].to_string()
+        }
     } else {
         format!(" [{}]  [h] show controls", mode_label)
     };
