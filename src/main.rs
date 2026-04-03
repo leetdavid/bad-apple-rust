@@ -1,66 +1,68 @@
 mod prepare;
 
 use clap::Parser;
-use crossterm::{cursor, execute, terminal};
+use ratatui::{
+    buffer::Buffer,
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    layout::Rect,
+    style::{Color, Modifier, Style},
+};
 use rodio::{Decoder, OutputStream, Sink};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write, stdout};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 const FPS: f64 = 30.0;
 
-// Precomputed ASCII digit bytes for 0–255, avoiding format!/write! in the hot path.
-// Each entry is [len, d0, d1, d2] where len is the number of valid digits.
-const fn make_num_table() -> [[u8; 4]; 256] {
-    let mut t = [[0u8; 4]; 256];
-    let mut i: usize = 0;
-    while i < 256 {
-        let n = i as u8;
-        if n < 10 {
-            t[i] = [1, b'0' + n, 0, 0];
-        } else if n < 100 {
-            t[i] = [2, b'0' + n / 10, b'0' + n % 10, 0];
-        } else {
-            t[i] = [3, b'0' + n / 100, b'0' + (n / 10) % 10, b'0' + n % 10];
-        }
-        i += 1;
+/// Placement of the video within the terminal.
+/// All coordinates are 0-indexed terminal columns/rows.
+#[derive(Debug, PartialEq)]
+struct VideoLayout {
+    /// Number of character-slot columns (draw_w * col_step = terminal columns used).
+    draw_w: u16,
+    /// Number of terminal rows used by the video.
+    draw_h: u16,
+    /// Leftmost terminal column of the video.
+    offset_x: u16,
+    /// Topmost terminal row of the video.
+    offset_y: u16,
+    /// The terminal row that the controls bar occupies (always the last row).
+    bar_row: u16,
+}
+
+/// Compute how the video should be laid out in the terminal.
+///
+/// The last row is always reserved for the controls bar.
+/// The video is scaled to fill as much of the remaining area as possible while
+/// preserving aspect ratio, then centered.
+fn compute_layout(term_w: u16, term_h: u16, vid_aspect: f32, col_step: u16) -> VideoLayout {
+    // Reserve the last terminal row for the controls bar.
+    let bar_row = term_h.saturating_sub(1);
+    let video_h = bar_row; // rows available to the video: 0 .. bar_row-1
+
+    let aspect_correction = if col_step == 1 { 2.0_f32 } else { 1.0_f32 };
+    let max_chars = term_w / col_step.max(1);
+
+    // Start by trying to fill the full width.
+    let mut draw_w = max_chars;
+    let mut draw_h = (draw_w as f32 / vid_aspect / aspect_correction).round() as u16;
+
+    // If that overflows the video rows, clamp to the available height instead.
+    if draw_h > video_h {
+        draw_h = video_h;
+        draw_w = (video_h as f32 * aspect_correction * vid_aspect).round() as u16;
     }
-    t
-}
-static BYTE_NUMS: [[u8; 4]; 256] = make_num_table();
 
-#[inline(always)]
-fn push_num(buf: &mut Vec<u8>, n: u8) {
-    let e = &BYTE_NUMS[n as usize];
-    buf.extend_from_slice(&e[1..1 + e[0] as usize]);
-}
+    let draw_w = draw_w.max(1);
+    let draw_h = draw_h.max(1);
 
-#[inline(always)]
-fn push_color_fg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
-    buf.extend_from_slice(b"\x1b[38;2;");
-    push_num(buf, r);
-    buf.push(b';');
-    push_num(buf, g);
-    buf.push(b';');
-    push_num(buf, b);
-    buf.push(b'm');
-}
+    let draw_w_cols = draw_w * col_step;
+    // Center horizontally; keep aligned to col_step boundaries for wide chars.
+    let offset_x = (term_w.saturating_sub(draw_w_cols) / 2 / col_step) * col_step;
+    // Center vertically within the video area (rows 0..bar_row).
+    let offset_y = video_h.saturating_sub(draw_h) / 2;
 
-#[inline(always)]
-fn push_color_bg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
-    buf.extend_from_slice(b"\x1b[48;2;");
-    push_num(buf, r);
-    buf.push(b';');
-    push_num(buf, g);
-    buf.push(b';');
-    push_num(buf, b);
-    buf.push(b'm');
-}
-
-#[inline(always)]
-fn push_char(buf: &mut Vec<u8>, c: char) {
-    let mut tmp = [0u8; 4];
-    buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+    VideoLayout { draw_w, draw_h, offset_x, offset_y, bar_row }
 }
 
 #[derive(Parser)]
@@ -71,9 +73,13 @@ struct Cli {
     /// Omit to replay the last prepared video.
     url: Option<String>,
 
-    /// Force re-download and re-processing even if cached assets exist.
+    /// Force re-download of the video (also triggers re-processing).
     #[arg(long)]
-    force: bool,
+    download: bool,
+
+    /// Force re-processing from the cached video without re-downloading.
+    #[arg(long)]
+    process: bool,
 
     /// Render mode [possible values: full-color, ascii-color, ascii, braille, korean, shading]
     #[arg(short, long, default_value = "full-color")]
@@ -120,10 +126,10 @@ struct Cli {
     #[arg(short = 'g', long)]
     gradient: Option<String>,
 
-    /// Frame width to use when preprocessing (default: 160).
+    /// Frame width to use when preprocessing (default: 320).
     /// Smaller values are faster to prepare and use less disk space.
-    /// Use --force to re-process at a different width.
-    #[arg(long, default_value = "160")]
+    /// Use --process to re-process at a different width.
+    #[arg(long, default_value = "320")]
     width: u32,
 
     /// Pass cookies from a browser to yt-dlp to bypass bot detection.
@@ -140,6 +146,11 @@ struct Cli {
     /// Example: --extractor-args "youtube:player_client=ios"
     #[arg(long)]
     extractor_args: Option<String>,
+
+    /// Brightness adjustment from -1.0 (darkest) to 1.0 (brightest), default 0.0.
+    /// Up/down arrows adjust brightness at runtime.
+    #[arg(short = 'b', long, default_value = "0", allow_hyphen_values = true)]
+    brightness: f32,
 }
 
 struct CharSet {
@@ -239,7 +250,6 @@ impl CharSet {
     }
 
     fn korean() -> Self {
-        // Sampled from "ㅇㅎ시늙뀪뾃": positions 0, 1, 3, 5
         CharSet {
             empty: 'ㅇ',
             top: '시',
@@ -260,10 +270,11 @@ fn main() {
 
     let frame_width = cli.width as usize;
 
-    let cache_entry = if cli.url.is_some() || cli.force {
+    let cache_entry = if cli.url.is_some() || cli.download || cli.process {
         match prepare::run(
             cli.url,
-            cli.force,
+            cli.download,
+            cli.process,
             frame_width,
             cli.cookies_from_browser,
             cli.cookies,
@@ -350,22 +361,18 @@ fn main() {
         render_mode_for_builtin(mode)
     };
 
-    // Use the mode's default colorize unless --monochrome overrides it.
     let mode_default_colorize = BUILTIN_MODES[mode_idx].1;
     let mut colorize = if monochrome {
         false
     } else {
         mode_default_colorize
     };
+    let mut brightness: f32 = cli.brightness.clamp(-1.0, 1.0);
 
     let mut mode_label: String = if cli.chars.is_some() || cli.gradient.is_some() {
         match &render_mode {
             RenderMode::Charset(cs) => {
-                let prefix = if cli.chars.is_some() {
-                    "custom"
-                } else {
-                    "gradient"
-                };
+                let prefix = if cli.chars.is_some() { "custom" } else { "gradient" };
                 format!("{} {}{}{}{}", prefix, cs.empty, cs.top, cs.bottom, cs.full)
             }
             RenderMode::FullColor => "full-color".to_string(),
@@ -384,7 +391,6 @@ fn main() {
         std::process::exit(1);
     });
     let mut frames_reader = BufReader::new(frames_file);
-    let (term_w, term_h) = terminal::size().unwrap_or((80, 24));
     let mut frame_buf = vec![0u8; frame_size];
 
     // Audio setup
@@ -404,10 +410,7 @@ fn main() {
     };
     let source = Decoder::new(std::io::Cursor::new(audio_bytes)).unwrap();
 
-    // Terminal setup
-    let mut stdout = stdout();
-    let has_tty = terminal::enable_raw_mode().is_ok();
-    let _ = execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide);
+    let mut terminal = ratatui::init();
 
     sink.append(source);
     sink.play();
@@ -423,8 +426,6 @@ fn main() {
     let mut fps_frames: u32 = 0;
     let mut fps_timer = Instant::now();
     let mut fps: f32 = 0.0;
-    // Reused across frames to avoid per-frame allocation
-    let mut render_buf: Vec<u8> = Vec::with_capacity(term_w as usize * term_h as usize * 24);
 
     while !done {
         let elapsed = if paused {
@@ -436,8 +437,6 @@ fn main() {
 
         if !paused && target_frame > current_frame {
             // Seek directly to target frame instead of reading through skipped frames.
-            // Reading each skipped frame takes O(frame_size) time and compounds lag —
-            // every slow render pushes target_frame further ahead on the next iteration.
             if target_frame > current_frame + 1 {
                 let byte_offset = target_frame as u64 * frame_size as u64;
                 let _ = frames_reader.seek(SeekFrom::Start(byte_offset));
@@ -453,23 +452,16 @@ fn main() {
                         fps_frames = 0;
                         fps_timer = Instant::now();
                     }
-                    let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                    render_frame(
-                        &mut stdout,
-                        &frame_buf,
-                        frame_w,
-                        frame_h,
-                        tw,
-                        th,
-                        &render_mode,
-                        colorize,
-                        &meta,
-                        &mode_label,
-                        show_controls,
-                        paused,
-                        fps,
-                        &mut render_buf,
-                    );
+                    terminal
+                        .draw(|frame| {
+                            let area = frame.area();
+                            let buf = frame.buffer_mut();
+                            render_to_buf(
+                                buf, area, &frame_buf, frame_w, frame_h, &render_mode,
+                                colorize, brightness, &meta, &mode_label, show_controls, paused, fps,
+                            );
+                        })
+                        .unwrap();
                 }
                 Err(_) => {
                     done = true;
@@ -477,28 +469,26 @@ fn main() {
             }
         }
 
-        if let Ok(true) = crossterm::event::poll(Duration::from_millis(10)) {
-            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+        if let Ok(true) = event::poll(Duration::from_millis(10)) {
+            if let Ok(Event::Key(key)) = event::read() {
                 // Ignore key-repeat and key-release; only act on the initial press.
-                if key.kind != crossterm::event::KeyEventKind::Press {
+                if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
-                    crossterm::event::KeyCode::Char('c')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         break;
                     }
-                    crossterm::event::KeyCode::Char('c') => {
+                    KeyCode::Char('c') => {
                         colorize = !colorize;
                     }
-                    crossterm::event::KeyCode::Char('h') => {
+                    KeyCode::Char('h') => {
                         show_controls = !show_controls;
                     }
-                    crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Char(' ') => {
+                    KeyCode::Char('k') | KeyCode::Char(' ') => {
                         if paused {
                             paused = false;
                             base_time = Instant::now();
@@ -509,35 +499,25 @@ fn main() {
                             sink.pause();
                         }
                         // Re-render immediately so the controls bar reflects the new state.
-                        let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                        render_frame(
-                            &mut stdout,
-                            &frame_buf,
-                            frame_w,
-                            frame_h,
-                            tw,
-                            th,
-                            &render_mode,
-                            colorize,
-                            &meta,
-                            &mode_label,
-                            show_controls,
-                            paused,
-                            fps,
-                            &mut render_buf,
-                        );
+                        terminal
+                            .draw(|frame| {
+                                let area = frame.area();
+                                let buf = frame.buffer_mut();
+                                render_to_buf(
+                                    buf, area, &frame_buf, frame_w, frame_h, &render_mode,
+                                    colorize, brightness, &meta, &mode_label, show_controls, paused, fps,
+                                );
+                            })
+                            .unwrap();
                     }
-                    crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Char('l') => {
+                    KeyCode::Char('j') | KeyCode::Char('l') => {
                         let current_pos = if paused {
                             base_offset
                         } else {
                             base_offset + base_time.elapsed().as_secs_f64()
                         };
-                        let delta = if key.code == crossterm::event::KeyCode::Char('j') {
-                            -10.0
-                        } else {
-                            10.0
-                        };
+                        let delta =
+                            if key.code == KeyCode::Char('j') { -10.0 } else { 10.0 };
                         let new_pos = (current_pos + delta).max(0.0);
                         let new_frame = (new_pos * FPS) as usize;
                         let byte_offset = new_frame as u64 * frame_size as u64;
@@ -549,29 +529,28 @@ fn main() {
                         if paused {
                             sink.pause();
                         }
-                        // Read and render one frame so the display updates immediately
+                        // Read and render one frame so the display updates immediately.
                         if frames_reader.read_exact(&mut frame_buf).is_ok() {
                             current_frame += 1;
-                            let (tw, th) = terminal::size().unwrap_or((term_w, term_h));
-                            render_frame(
-                                &mut stdout,
-                                &frame_buf,
-                                frame_w,
-                                frame_h,
-                                tw,
-                                th,
-                                &render_mode,
-                                colorize,
-                                &meta,
-                                &mode_label,
-                                show_controls,
-                                paused,
-                                fps,
-                                &mut render_buf,
-                            );
+                            terminal
+                                .draw(|frame| {
+                                    let area = frame.area();
+                                    let buf = frame.buffer_mut();
+                                    render_to_buf(
+                                        buf, area, &frame_buf, frame_w, frame_h, &render_mode,
+                                        colorize, brightness, &meta, &mode_label, show_controls, paused, fps,
+                                    );
+                                })
+                                .unwrap();
                         }
                     }
-                    crossterm::event::KeyCode::Left => {
+                    KeyCode::Up => {
+                        brightness = (brightness + 0.1).min(1.0);
+                    }
+                    KeyCode::Down => {
+                        brightness = (brightness - 0.1).max(-1.0);
+                    }
+                    KeyCode::Left => {
                         mode_idx = (mode_idx + BUILTIN_MODES.len() - 1) % BUILTIN_MODES.len();
                         render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx].0);
                         mode_label = BUILTIN_MODES[mode_idx].0.to_string();
@@ -579,7 +558,7 @@ fn main() {
                             colorize = BUILTIN_MODES[mode_idx].1;
                         }
                     }
-                    crossterm::event::KeyCode::Right => {
+                    KeyCode::Right => {
                         mode_idx = (mode_idx + 1) % BUILTIN_MODES.len();
                         render_mode = render_mode_for_builtin(BUILTIN_MODES[mode_idx].0);
                         mode_label = BUILTIN_MODES[mode_idx].0.to_string();
@@ -593,10 +572,7 @@ fn main() {
         }
     }
 
-    let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
-    if has_tty {
-        let _ = terminal::disable_raw_mode();
-    }
+    ratatui::restore();
 }
 
 fn render_mode_for_builtin(mode: &str) -> RenderMode {
@@ -610,175 +586,116 @@ fn render_mode_for_builtin(mode: &str) -> RenderMode {
     }
 }
 
-fn render_frame(
-    stdout: &mut std::io::Stdout,
+fn render_to_buf(
+    buf: &mut Buffer,
+    area: Rect,
     frame: &[u8],
     frame_w: usize,
     frame_h: usize,
-    term_w: u16,
-    term_h: u16,
     render_mode: &RenderMode,
     colorize: bool,
+    brightness: f32,
     meta: &prepare::VideoMeta,
     mode_label: &str,
     show_controls: bool,
     paused: bool,
     fps: f32,
-    buf: &mut Vec<u8>,
 ) {
+    let term_w = area.width;
+    let term_h = area.height;
+
     let vid_aspect = meta.orig_width as f32 / meta.orig_height as f32;
     let col_step = match render_mode {
         RenderMode::Charset(cs) => cs.col_width,
         RenderMode::FullColor => 1,
     };
-    let aspect_correction = if col_step == 1 { 2.0_f32 } else { 1.0_f32 };
 
-    let max_chars = term_w / col_step;
-    let mut draw_w = max_chars;
-    let mut draw_h = (draw_w as f32 / vid_aspect / aspect_correction).round() as u16;
-    if draw_h > term_h {
-        draw_h = term_h;
-        draw_w = (term_h as f32 * aspect_correction * vid_aspect).round() as u16;
-    }
-    let draw_w = draw_w.max(1);
-    let draw_h = draw_h.max(1);
+    let layout = compute_layout(term_w, term_h, vid_aspect, col_step);
+    let VideoLayout { draw_w, draw_h, offset_x, offset_y, bar_row } = layout;
 
-    let draw_w_cols = draw_w * col_step;
-    let offset_x = ((term_w.saturating_sub(draw_w_cols)) / 2 / col_step) * col_step;
-    let offset_y = (term_h.saturating_sub(draw_h)) / 2;
-
-    buf.clear();
-    buf.extend_from_slice(b"\x1b[H");
+    // Ratatui clears the buffer to default cells before each draw, so letterboxed
+    // areas are automatically blank — we only need to fill the video region.
 
     match render_mode {
-        RenderMode::Charset(cs) => {
-            let sentinel = (255u8, 255u8, 255u8);
-            let mut last_fg = sentinel;
-
-            for y in 0..term_h {
-                let mut x = 0u16;
-                while x < term_w {
-                    let in_bounds = x >= offset_x
-                        && x < offset_x + draw_w_cols
-                        && y >= offset_y
-                        && y < offset_y + draw_h;
-
-                    if !in_bounds {
-                        if colorize && last_fg != sentinel {
-                            buf.extend_from_slice(b"\x1b[0m");
-                            last_fg = sentinel;
-                        }
-                        for _ in 0..col_step {
-                            buf.push(b' ');
-                        }
-                    } else {
-                        let rel_x = (x - offset_x) / col_step;
-                        let rel_y = y - offset_y;
-                        let src_x = ((rel_x as f32 / draw_w as f32) * frame_w as f32) as usize;
-                        let src_y_top = ((rel_y as f32 / draw_h as f32) * frame_h as f32) as usize;
-                        let src_y_bot =
-                            (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
-                        let top = get_pixel(frame, src_x, src_y_top, frame_w, frame_h);
-                        let bottom = get_pixel(frame, src_x, src_y_bot, frame_w, frame_h);
-                        if colorize {
-                            let fg = get_rgb(frame, src_x, src_y_top, frame_w, frame_h);
-                            if fg != last_fg {
-                                push_color_fg(buf, fg.0, fg.1, fg.2);
-                                last_fg = fg;
-                            }
-                        }
-                        let ch = match (top, bottom) {
-                            (false, false) => cs.empty,
-                            (true, false) => cs.top,
-                            (false, true) => cs.bottom,
-                            (true, true) => cs.full,
-                        };
-                        push_char(buf, ch);
-                    }
-                    x += col_step;
-                }
-                if colorize && last_fg != sentinel {
-                    buf.extend_from_slice(b"\x1b[0m");
-                    last_fg = sentinel;
-                }
-                if y < term_h - 1 {
-                    buf.extend_from_slice(b"\r\n");
+        RenderMode::FullColor => {
+            for y in 0..draw_h {
+                for x in 0..draw_w {
+                    let cell_x = offset_x + x;
+                    let cell_y = offset_y + y;
+                    let src_x = ((x as f32 / draw_w as f32) * frame_w as f32) as usize;
+                    let src_y_top =
+                        ((y as f32 / draw_h as f32) * frame_h as f32) as usize;
+                    let src_y_bot =
+                        (((y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
+                    let fg = adjust_rgb(get_rgb(frame, src_x, src_y_top, frame_w, frame_h), brightness);
+                    let bg = adjust_rgb(get_rgb(frame, src_x, src_y_bot, frame_w, frame_h), brightness);
+                    buf.set_string(
+                        cell_x,
+                        cell_y,
+                        "▀",
+                        Style::new()
+                            .fg(Color::Rgb(fg.0, fg.1, fg.2))
+                            .bg(Color::Rgb(bg.0, bg.1, bg.2)),
+                    );
                 }
             }
         }
-        RenderMode::FullColor => {
-            let sentinel = (255u8, 255u8, 255u8);
-            let mut last_fg = sentinel;
-            let mut last_bg = sentinel;
-
-            for y in 0..term_h {
-                for x in 0..term_w {
-                    let in_bounds = x >= offset_x
-                        && x < offset_x + draw_w_cols
-                        && y >= offset_y
-                        && y < offset_y + draw_h;
-
-                    if !in_bounds {
-                        if last_fg != sentinel || last_bg != sentinel {
-                            buf.extend_from_slice(b"\x1b[0m");
-                            last_fg = sentinel;
-                            last_bg = sentinel;
-                        }
-                        buf.push(b' ');
+        RenderMode::Charset(cs) => {
+            let mut ch_buf = [0u8; 4];
+            for y in 0..draw_h {
+                for x in 0..draw_w {
+                    let cell_x = offset_x + x * cs.col_width;
+                    let cell_y = offset_y + y;
+                    let src_x = ((x as f32 / draw_w as f32) * frame_w as f32) as usize;
+                    let src_y_top =
+                        ((y as f32 / draw_h as f32) * frame_h as f32) as usize;
+                    let src_y_bot =
+                        (((y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
+                    let top = get_pixel(frame, src_x, src_y_top, frame_w, frame_h, brightness);
+                    let bottom = get_pixel(frame, src_x, src_y_bot, frame_w, frame_h, brightness);
+                    let ch = match (top, bottom) {
+                        (false, false) => cs.empty,
+                        (true, false) => cs.top,
+                        (false, true) => cs.bottom,
+                        (true, true) => cs.full,
+                    };
+                    let style = if colorize {
+                        let rgb = adjust_rgb(get_rgb(frame, src_x, src_y_top, frame_w, frame_h), brightness);
+                        Style::new().fg(Color::Rgb(rgb.0, rgb.1, rgb.2))
                     } else {
-                        let rel_x = x - offset_x;
-                        let rel_y = y - offset_y;
-                        let src_x = ((rel_x as f32 / draw_w as f32) * frame_w as f32) as usize;
-                        let src_y_top = ((rel_y as f32 / draw_h as f32) * frame_h as f32) as usize;
-                        let src_y_bot =
-                            (((rel_y as f32 + 0.5) / draw_h as f32) * frame_h as f32) as usize;
-                        let fg = get_rgb(frame, src_x, src_y_top, frame_w, frame_h);
-                        let bg = get_rgb(frame, src_x, src_y_bot, frame_w, frame_h);
-                        if fg != last_fg {
-                            push_color_fg(buf, fg.0, fg.1, fg.2);
-                            last_fg = fg;
-                        }
-                        if bg != last_bg {
-                            push_color_bg(buf, bg.0, bg.1, bg.2);
-                            last_bg = bg;
-                        }
-                        buf.extend_from_slice(b"\xe2\x96\x80"); // ▀
-                    }
-                }
-                if last_fg != sentinel || last_bg != sentinel {
-                    buf.extend_from_slice(b"\x1b[0m");
-                    last_fg = sentinel;
-                    last_bg = sentinel;
-                }
-                if y < term_h - 1 {
-                    buf.extend_from_slice(b"\r\n");
+                        Style::default()
+                    };
+                    let symbol = ch.encode_utf8(&mut ch_buf);
+                    buf.set_string(cell_x, cell_y, &*symbol, style);
                 }
             }
         }
     }
 
-    // Bottom bar — full-width reverse-video strip on the last row
+    // Controls bar: full-width reverse-video strip on bar_row (the last terminal row).
     let bar_text = if show_controls {
         let pause_label = if paused { "resume" } else { "pause" };
-        let s = format!(
-            "{:.1}fps  [{}]  [←/→] mode  [k] {pause_label}  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
-            fps, mode_label,
-        );
-        // Pad or truncate to exactly term_w columns so the bar fills the row
-        let tw = term_w as usize;
-        if s.len() < tw {
-            format!("{:<width$}", s, width = tw)
-        } else {
-            s[..tw].to_string()
-        }
+        format!(
+            "{:.1}fps  {}x{}  [{}]  [←/→] mode  [↑/↓] brt:{:+.1}  [k] {pause_label}  [j] -10s  [l] +10s  [c] color  [q] quit  [h] hide",
+            fps, term_w, term_h, mode_label, brightness,
+        )
     } else {
         format!(" [{}]  [h] show controls", mode_label)
     };
-    let bar = format!("\x1b[{};1H\x1b[7m{}\x1b[0m", term_h, bar_text);
-    buf.extend_from_slice(bar.as_bytes());
-
-    stdout.write_all(buf).unwrap();
-    stdout.flush().unwrap();
+    let tw = term_w as usize;
+    // Pad/truncate by char count (not bytes) so multi-byte chars like ← → don't misalign.
+    let char_count = bar_text.chars().count();
+    let padded = if char_count < tw {
+        format!("{:<width$}", bar_text, width = tw)
+    } else {
+        bar_text.chars().take(tw).collect::<String>()
+    };
+    buf.set_string(
+        area.x,
+        area.y + bar_row,
+        &padded,
+        Style::new().add_modifier(Modifier::REVERSED),
+    );
 }
 
 fn get_rgb(
@@ -794,7 +711,259 @@ fn get_rgb(
     (frame[base], frame[base + 1], frame[base + 2])
 }
 
-fn get_pixel(frame: &[u8], src_x: usize, src_y: usize, frame_w: usize, frame_h: usize) -> bool {
+/// Shift each channel by `brightness` (-1.0 = black, +1.0 = white).
+fn adjust_rgb((r, g, b): (u8, u8, u8), brightness: f32) -> (u8, u8, u8) {
+    let adj = brightness * 255.0;
+    let clamp = |v: f32| v.clamp(0.0, 255.0) as u8;
+    (clamp(r as f32 + adj), clamp(g as f32 + adj), clamp(b as f32 + adj))
+}
+
+/// Returns true if the pixel is "lit", after applying brightness to the luminance threshold.
+/// brightness > 0 makes more pixels appear lit; brightness < 0 requires brighter pixels.
+fn get_pixel(frame: &[u8], src_x: usize, src_y: usize, frame_w: usize, frame_h: usize, brightness: f32) -> bool {
     let (r, g, b) = get_rgb(frame, src_x, src_y, frame_w, frame_h);
-    (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) > 128_000
+    let luma = r as f32 * 299.0 + g as f32 * 587.0 + b as f32 * 114.0;
+    luma + brightness * 128_000.0 > 128_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{layout::Position, style::Modifier};
+
+    fn make_meta(orig_w: usize, orig_h: usize) -> prepare::VideoMeta {
+        prepare::VideoMeta {
+            orig_width: orig_w,
+            orig_height: orig_h,
+            frame_width: orig_w,
+            frame_height: orig_h,
+        }
+    }
+
+    // ── compute_layout invariants ──────────────────────────────────────────────
+
+    /// The video must never spill into the bar row.
+    #[test]
+    fn layout_video_stays_above_bar() {
+        let cases = [
+            (80u16, 24u16, 16.0_f32 / 9.0, 1u16),
+            (160, 50, 16.0 / 9.0, 1),
+            (120, 40, 4.0 / 3.0, 1),
+            (80, 24, 4.0 / 3.0, 2), // wide chars
+            (200, 60, 21.0 / 9.0, 1), // ultra-wide
+            (80, 24, 1.0 / 3.0, 1),  // very tall video
+        ];
+        for (tw, th, aspect, col_step) in cases {
+            let l = compute_layout(tw, th, aspect, col_step);
+            let last_video_row = l.offset_y + l.draw_h - 1;
+            assert!(
+                last_video_row < l.bar_row,
+                "tw={tw} th={th}: video last row {last_video_row} >= bar row {}",
+                l.bar_row
+            );
+        }
+    }
+
+    /// The bar row is always the last terminal row.
+    #[test]
+    fn layout_bar_row_is_last_row() {
+        for th in [1u16, 2, 10, 24, 50, 100] {
+            let l = compute_layout(80, th, 16.0 / 9.0, 1);
+            assert_eq!(l.bar_row, th - 1, "th={th}: bar_row should be {}", th - 1);
+        }
+    }
+
+    /// The video should fill the full terminal width when the aspect ratio allows.
+    #[test]
+    fn layout_maximizes_width_for_wide_video() {
+        // 16:9 at 160 wide: draw_h will be within video_h so width won't be clipped.
+        let l = compute_layout(160, 50, 16.0 / 9.0, 1);
+        assert_eq!(l.draw_w, 160, "wide video should fill full width");
+        assert_eq!(l.offset_x, 0);
+    }
+
+    /// The video should be horizontally centered (left/right padding equal ±1).
+    #[test]
+    fn layout_horizontal_centering() {
+        // 4:3 in 160-wide terminal forces height clamping → narrower video → side padding.
+        let l = compute_layout(160, 50, 4.0 / 3.0, 1);
+        let used_cols = l.draw_w * 1;
+        let left = l.offset_x;
+        let right = 160u16.saturating_sub(left + used_cols);
+        assert!(
+            (left as i32 - right as i32).abs() <= 1,
+            "not centered: left={left} right={right}"
+        );
+    }
+
+    /// The video should be vertically centered within the video area (±1 for rounding).
+    #[test]
+    fn layout_vertical_centering() {
+        let l = compute_layout(160, 50, 16.0 / 9.0, 1);
+        let top = l.offset_y;
+        // Space below video but above the bar row.
+        let bottom = l.bar_row.saturating_sub(l.offset_y + l.draw_h);
+        assert!(
+            (top as i32 - bottom as i32).abs() <= 1,
+            "not vertically centered: top={top} bottom={bottom} bar={}",
+            l.bar_row
+        );
+    }
+
+    /// Video must stay within terminal width.
+    #[test]
+    fn layout_video_within_width() {
+        for col_step in [1u16, 2] {
+            let l = compute_layout(80, 24, 16.0 / 9.0, col_step);
+            assert!(
+                l.offset_x + l.draw_w * col_step <= 80,
+                "video overflows terminal width (col_step={col_step})"
+            );
+        }
+    }
+
+    // ── render_to_buf invariants ───────────────────────────────────────────────
+
+    fn solid_frame(w: usize, h: usize) -> Vec<u8> {
+        // Non-black/non-default so FullColor video cells are identifiable.
+        vec![128u8; w * h * 3]
+    }
+
+    fn render_test_buf(tw: u16, th: u16, meta: &prepare::VideoMeta, show_controls: bool) -> Buffer {
+        let area = Rect::new(0, 0, tw, th);
+        let mut buf = Buffer::empty(area);
+        let frame = solid_frame(meta.frame_width, meta.frame_height);
+        render_to_buf(
+            &mut buf, area, &frame,
+            meta.frame_width, meta.frame_height,
+            &RenderMode::FullColor, false, meta,
+            "full-color", show_controls, false, 30.0,
+        );
+        buf
+    }
+
+    /// REVERSED must appear on EVERY column of the last row and NOWHERE ELSE.
+    /// If the bar is at the wrong row (e.g. row 0 instead of row th-1), this fails.
+    #[test]
+    fn bar_is_exclusively_on_last_row() {
+        // Includes (543, 130) = the 4K terminal size (height-constrained path).
+        for (tw, th) in [(80u16, 24u16), (160, 50), (120, 40), (40, 10), (543, 130)] {
+            let meta = make_meta(16, 9);
+            let buf = render_test_buf(tw, th, &meta, true);
+
+            for row in 0..th {
+                for col in 0..tw {
+                    let has_rev = buf
+                        .cell(Position::new(col, row))
+                        .unwrap()
+                        .modifier
+                        .contains(Modifier::REVERSED);
+                    if row == th - 1 {
+                        assert!(
+                            has_rev,
+                            "tw={tw} th={th}: bar MISSING at row={row} col={col}"
+                        );
+                    } else {
+                        assert!(
+                            !has_rev,
+                            "tw={tw} th={th}: REVERSED spuriously at row={row} col={col} — bar should only be on row {}",
+                            th - 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same contract when controls are hidden.
+    #[test]
+    fn bar_is_on_last_row_when_hidden() {
+        let (tw, th) = (80u16, 24u16);
+        let meta = make_meta(16, 9);
+        let buf = render_test_buf(tw, th, &meta, false);
+
+        for row in 0..th {
+            for col in 0..tw {
+                let has_rev = buf
+                    .cell(Position::new(col, row))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED);
+                if row == th - 1 {
+                    assert!(has_rev, "hidden bar MISSING at row={row} col={col}");
+                } else {
+                    assert!(!has_rev, "REVERSED spuriously at row={row} col={col}");
+                }
+            }
+        }
+    }
+
+    /// Video cells and letterbox placement for a width-constrained terminal
+    /// (video fills full width, top/bottom letterbox present).
+    #[test]
+    fn video_placement_width_constrained() {
+        // 16:9 at 160×50: draw_w=160, draw_h=45, offset_y=2 → rows 0-1 and 47-48 letterbox.
+        let (tw, th) = (160u16, 50u16);
+        let meta = make_meta(16, 9);
+        let buf = render_test_buf(tw, th, &meta, true);
+        let layout = compute_layout(tw, th, 16.0 / 9.0, 1);
+
+        assert!(layout.offset_y > 0, "expected top letterbox for this terminal");
+        assert!(layout.offset_y + layout.draw_h < layout.bar_row, "expected bottom letterbox");
+
+        check_video_and_letterbox(&buf, tw, th, &layout);
+    }
+
+    /// Video cells and letterbox placement for a height-constrained terminal
+    /// (video fills full height of video area, left/right letterbox present).
+    /// This is the 4K case: 543×130.
+    #[test]
+    fn video_placement_height_constrained_4k() {
+        let (tw, th) = (543u16, 130u16);
+        let meta = make_meta(16, 9);
+        let buf = render_test_buf(tw, th, &meta, true);
+        let layout = compute_layout(tw, th, 16.0 / 9.0, 1);
+
+        // Height-constrained: video fills all video_h rows, so no top/bottom letterbox.
+        assert_eq!(layout.draw_h, th - 1, "video should fill full video height");
+        assert_eq!(layout.offset_y, 0, "no top letterbox expected");
+        // But there should be left/right letterbox.
+        assert!(layout.offset_x > 0, "expected left/right letterbox for 16:9 in wide terminal");
+
+        check_video_and_letterbox(&buf, tw, th, &layout);
+    }
+
+    /// Shared checker: scans every cell and asserts correct placement.
+    fn check_video_and_letterbox(buf: &Buffer, tw: u16, th: u16, layout: &VideoLayout) {
+        let video_top = layout.offset_y;
+        let video_bot = layout.offset_y + layout.draw_h; // exclusive
+        let vid_left = layout.offset_x;
+        let vid_right = layout.offset_x + layout.draw_w; // exclusive
+
+        for row in 0..th {
+            for col in 0..tw {
+                let cell = buf.cell(Position::new(col, row)).unwrap();
+                let is_video = cell.symbol() == "▀"
+                    && cell.fg != ratatui::style::Color::Reset;
+                let is_bar = cell.modifier.contains(Modifier::REVERSED);
+
+                if row == layout.bar_row {
+                    assert!(is_bar, "row={row} col={col}: expected bar cell");
+                } else if row >= video_top && row < video_bot
+                    && col >= vid_left && col < vid_right
+                {
+                    assert!(
+                        is_video,
+                        "row={row} col={col}: expected ▀ inside video bounds"
+                    );
+                } else {
+                    // Letterbox or out-of-video-bounds: must be empty.
+                    assert!(
+                        !is_video && !is_bar,
+                        "row={row} col={col}: expected empty cell in letterbox region"
+                    );
+                }
+            }
+        }
+    }
 }

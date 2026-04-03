@@ -56,7 +56,8 @@ pub fn load_meta(entry: &Path) -> Result<VideoMeta, String> {
 
 pub fn run(
     source: Option<String>,
-    force: bool,
+    force_download: bool,
+    force_process: bool,
     frame_width: usize,
     cookies_from_browser: Option<String>,
     cookies: Option<String>,
@@ -65,14 +66,17 @@ pub fn run(
     let source = source.unwrap_or_else(|| DEFAULT_URL.to_string());
     let entry = entry_dir(&source);
 
-    // Cache hit: frames.bin and audio.mp3 exist at the right resolution
-    let frames_ok = !force
+    // Re-downloading implies re-processing (new video file = stale frames/audio).
+    let force_process = force_process || force_download;
+
+    // Cache hit: frames.bin and audio.mp3 exist at the right resolution.
+    let frames_ok = !force_process
         && entry.join("frames.bin").exists()
         && load_meta(&entry).map(|m| m.frame_width == frame_width).unwrap_or(false);
-    let audio_ok = !force && entry.join("audio.mp3").exists();
+    let audio_ok = !force_process && entry.join("audio.mp3").exists();
 
     if frames_ok && audio_ok {
-        println!("Using cached assets (use --force to re-process).");
+        println!("Using cached assets at {}", entry.display());
         set_last(&source)?;
         return Ok(entry);
     }
@@ -86,10 +90,11 @@ pub fn run(
     let tmp_video = std::env::temp_dir().join("bad-apple-src.mp4");
     let cached_video = entry.join("video.mp4");
 
-    // Use cached video.mp4 if available (avoids re-downloading for resolution changes)
+    // Use cached video.mp4 when reprocessing (avoids re-downloading for resolution changes).
     let src_path: PathBuf = if is_local {
         PathBuf::from(&source)
-    } else if !force && cached_video.exists() {
+    } else if !force_download && cached_video.exists() {
+        println!("Using cached video at {}", cached_video.display());
         cached_video.clone()
     } else {
         check_tool("yt-dlp", "https://github.com/yt-dlp/yt-dlp")?;
@@ -115,8 +120,8 @@ pub fn run(
         extract_frames(&src_path, &entry.join("frames.bin"), frame_width, frame_h)?;
     }
 
-    // Keep video.mp4 in cache for future re-processing at a different resolution
-    if !cached_video.exists() || force {
+    // Keep video.mp4 in cache for future re-processing at a different resolution.
+    if !cached_video.exists() || force_download {
         if src_path == tmp_video {
             fs::rename(&tmp_video, &cached_video)
                 .or_else(|_| fs::copy(&tmp_video, &cached_video).map(|_| ()).map_err(|e| e.to_string()))

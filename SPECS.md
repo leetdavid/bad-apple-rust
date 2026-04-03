@@ -20,7 +20,7 @@ Parsed assets are cached in `~/.cache/bad-apple/`, keyed by a hash of the source
 
 ```
 --force                          Force re-download and re-processing even if cached assets exist
---width <N>                      Frame width for preprocessing (default: 160); use --force to change
+--width <N>                      Frame width for preprocessing (default: 320); use --process to change
 --cookies-from-browser <browser> Pass browser cookies to yt-dlp (e.g. chrome, firefox)
 --cookies <file>                 Pass a Netscape cookies file to yt-dlp
 --extractor-args <args>          Pass --extractor-args to yt-dlp (e.g. "youtube:player_client=ios")
@@ -82,6 +82,7 @@ The default mode is `full-color`.
 ## Options
 
 ```
+-b, --brightness <f>     Initial brightness from -1.0 (darkest) to 1.0 (brightest), default 0.0
 -m, --mode <name>        Select a built-in render mode by name
 --full-color             ▀ with 24-bit fg/bg color (default; conflicts with --monochrome)
 --ascii-color            .:-=+*#%@ gradient with color
@@ -102,6 +103,8 @@ Character display width is auto-detected; wide/CJK characters trigger the 2-colu
 |-------------|-------------------------------------------|
 | `left`      | Cycle backward through built-in modes     |
 | `right`     | Cycle forward through built-in modes      |
+| `up`        | Increase brightness (+0.1)                |
+| `down`      | Decrease brightness (-0.1)                |
 | `k` / space | Pause / unpause                           |
 | `j`         | Rewind 10 seconds                         |
 | `l`         | Fast-forward 10 seconds                   |
